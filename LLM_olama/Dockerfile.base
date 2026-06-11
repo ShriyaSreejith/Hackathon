@@ -1,0 +1,203 @@
+# NemoClaw sandbox base image — expensive, rarely-changing layers.
+#
+# Contains: node:22-trixie-slim, apt packages, gosu, user/group setup,
+# .openclaw directory structure, OpenClaw CLI, and PyYAML.
+#
+# Built on main merges and pushed to GHCR. The production Dockerfile
+# layers PR-specific code (plugin, blueprint, config) on top.
+#
+# ── Why these layers are safe to cache ──────────────────────────────────
+#
+# Everything in this file is either pinned to an exact version or is
+# structural (users, directories, symlinks) that doesn't depend on
+# NemoClaw application code. Specifically:
+#
+#   node:22-trixie-slim — pinned by sha256 digest, checked weekly by
+#                          docker-pin-check.yaml
+#   apt packages        — pinned to exact Debian trixie versions
+#   gosu 1.19           — pinned release + per-arch sha256 checksum
+#   gateway/sandbox     — OS users and groups; names and UIDs are a
+#     users               stable contract with OpenShell
+#   .openclaw dirs      — directory structure is dictated by the OpenClaw
+#                          CLI layout; new dirs are additive (add them
+#                          here and rebuild)
+#   openclaw CLI        — version set by ARG OPENCLAW_VERSION (default below); override with --build-arg
+#   pyyaml              — pinned to exact pip version (6.0.3)
+#
+# Nothing here references NemoClaw plugin source, blueprint files,
+# startup scripts, or build-time config (model, provider, auth token).
+# Those all live in the production Dockerfile's thin top layers.
+#
+# ── When to rebuild ─────────────────────────────────────────────────────
+#
+# The base-image.yaml workflow rebuilds automatically on main merges that
+# touch this file. You need to edit this file (triggering a rebuild) when:
+#
+#   1. OpenClaw CLI version bump    — update OPENCLAW_VERSION default below, or override via --build-arg / workflow_dispatch
+#   2. New apt package needed       — add it to the apt-get install list
+#   3. gosu upgrade                 — update URL, checksum, and version
+#   4. node:22-trixie-slim digest rotated — update-docker-pin.sh updates all
+#                                      Dockerfile and Dockerfile.base
+#   5. New .openclaw subdirectory   — add mkdir below
+#   6. PyYAML or other pip dep bump — change the version below
+#
+# For ad-hoc rebuilds (e.g., security patch), use workflow_dispatch on
+# the base-image workflow.
+#
+# Expected rebuild frequency: every few weeks to months, driven mostly
+# by OpenClaw CLI version bumps or the weekly docker-pin-check.
+# ────────────────────────────────────────────────────────────────────────
+
+FROM arm64v8/node:22-trixie-slim@sha256:66daa655a619b972eab04bf1b0b6a7498ca772423bbb5f6295a0a733906dec44
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3=3.13.5-1 \
+        python3-pip=25.1.1+dfsg-1 \
+        python3-venv=3.13.5-1 \
+        curl=8.14.1-2+deb13u2 \
+        git=1:2.47.3-0+deb13u1 \
+        gnupg=2.4.7-21+deb13u1 \
+        ca-certificates=20250419 \
+        iproute2=6.15.0-1 \
+        iptables=1.8.11-2 \
+        libcap2-bin=1:2.75-10+b8 \
+        procps=2:4.0.4-9 \
+        e2fsprogs=1.47.2-3+b10 \
+        "dos2unix=7.5.2-1*" \
+        jq=1.7.1-6+deb13u1 \
+        vim-tiny=2:9.1.1230-2 \
+        openssh-sftp-server=1:10.0p1-7+deb13u2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# gosu for privilege separation (gateway vs sandbox user).
+# Install from GitHub release with checksum verification instead of
+# Debian's packaged gosu can lag upstream. Pinned to 1.19 (2025-09).
+# hadolint ignore=DL4006
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        amd64) gosu_asset="gosu-amd64"; gosu_sha256="52c8749d0142edd234e9d6bd5237dff2d81e71f43537e2f4f66f75dd4b243dd0" ;; \
+        arm64) gosu_asset="gosu-arm64"; gosu_sha256="3a8ef022d82c0bc4a98bcb144e77da714c25fcfa64dccc57f6aba7ae47ff1a44" ;; \
+        *) echo "Unsupported architecture for gosu: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/1.19/${gosu_asset}" \
+    && echo "${gosu_sha256}  /usr/local/bin/gosu" | sha256sum -c - \
+    && chmod +x /usr/local/bin/gosu \
+    && gosu --version
+
+# Create sandbox user (matches OpenShell convention) and gateway user.
+# The gateway runs as 'gateway' so the 'sandbox' user (agent) cannot
+# kill it or restart it with a tampered HOME/config.
+#
+# `gateway` is also a member of the `sandbox` group so both users can write
+# to the mutable-default OpenClaw config tree (chmod g+w + setgid below).
+# This replaces the previous EACCES-swallow approach for control-UI config
+# mutations — see #2681. UIDs stay distinct (security separation preserved);
+# the shared group only governs the mutable-default state directory.
+RUN groupadd -r gateway && useradd -r -g gateway -d /sandbox -s /usr/sbin/nologin gateway \
+    && groupadd -r sandbox && useradd -r -g sandbox -d /sandbox -s /bin/bash sandbox \
+    && usermod -aG sandbox gateway \
+    && mkdir -p /sandbox/.nemoclaw \
+    && chown -R sandbox:sandbox /sandbox
+
+# Create .openclaw with all state subdirs directly (mutable by default).
+# No separate .openclaw-data or symlink bridge — the production Dockerfile
+# layers config on top and sets final permissions.
+# Ref: https://github.com/NVIDIA/NemoClaw/issues/514
+RUN mkdir -p /sandbox/.openclaw/agents/main/agent \
+        /sandbox/.openclaw/extensions \
+        /sandbox/.openclaw/workspace \
+        /sandbox/.openclaw/skills \
+        /sandbox/.openclaw/hooks \
+        /sandbox/.openclaw/identity \
+        /sandbox/.openclaw/devices \
+        /sandbox/.openclaw/canvas \
+        /sandbox/.openclaw/cron \
+        /sandbox/.openclaw/memory \
+        /sandbox/.openclaw/logs \
+        /sandbox/.openclaw/credentials \
+        /sandbox/.openclaw/flows \
+        /sandbox/.openclaw/sandbox \
+        /sandbox/.openclaw/telegram \
+        /sandbox/.openclaw/plugin-runtime-deps \
+    && touch /sandbox/.openclaw/update-check.json \
+    && touch /sandbox/.openclaw/exec-approvals.json \
+    && chown -R sandbox:sandbox /sandbox/.openclaw \
+    && chmod -R g+w /sandbox/.openclaw \
+    && find /sandbox/.openclaw -type d -exec chmod g+s {} +
+
+# Pre-create shell init files for the sandbox user.
+# Runtime proxy config is written by the entrypoint to /tmp/nemoclaw-proxy-env.sh
+# (root-owned, mode 444, sticky-bit protected) and sourced from here on every
+# interactive session.
+# Ref: #2181 — the file must not be writable by the sandbox user.
+# hadolint ignore=SC2028
+RUN printf '%s\n' \
+        '# Source runtime proxy config' \
+        '[ -f /tmp/nemoclaw-proxy-env.sh ] && . /tmp/nemoclaw-proxy-env.sh' \
+        > /sandbox/.bashrc \
+    && printf '%s\n' \
+        '# Source runtime proxy config' \
+        '[ -f /tmp/nemoclaw-proxy-env.sh ] && . /tmp/nemoclaw-proxy-env.sh' \
+        > /sandbox/.profile \
+    && chown root:root /sandbox/.bashrc /sandbox/.profile \
+    && chmod 444 /sandbox/.bashrc /sandbox/.profile
+
+# System-wide proxy hooks. The per-home rc files above only fire for shells
+# that find `~/.bashrc` / `~/.profile` (sandbox user, HOME=/sandbox). SSH
+# sessions and tools that spawn `bash -ic` / `bash -lc` from a different user
+# or HOME silently miss the proxy env. These two hooks make the same
+# /tmp/nemoclaw-proxy-env.sh source for every bash mode regardless of user:
+#
+#   /etc/profile.d/nemoclaw-proxy.sh — sourced by /etc/profile for any login
+#     shell (bash -l, bash -lc).
+#   /etc/bash.bashrc — sourced by every interactive bash (bash -i, bash -ic).
+#     Prepend before the stock `[ -z "$PS1" ] && return` guard so the source
+#     line still runs in non-TTY contexts where PS1 may be unset when the
+#     file is first read.
+#
+# Both files are root-owned and not writable by the sandbox user.
+# Ref: https://github.com/NVIDIA/NemoClaw/issues/2704
+# hadolint ignore=SC2028
+RUN printf '%s\n' \
+        '# NemoClaw runtime proxy config — see /tmp/nemoclaw-proxy-env.sh (#2704)' \
+        '[ -f /tmp/nemoclaw-proxy-env.sh ] && . /tmp/nemoclaw-proxy-env.sh' \
+        > /etc/profile.d/nemoclaw-proxy.sh \
+    && chmod 444 /etc/profile.d/nemoclaw-proxy.sh \
+    && { printf '%s\n' \
+            '# NemoClaw runtime proxy config — see /tmp/nemoclaw-proxy-env.sh (#2704)' \
+            '[ -f /tmp/nemoclaw-proxy-env.sh ] && . /tmp/nemoclaw-proxy-env.sh' \
+            ''; \
+         cat /etc/bash.bashrc; \
+       } > /etc/bash.bashrc.new \
+    && mv /etc/bash.bashrc.new /etc/bash.bashrc \
+    && chmod 444 /etc/bash.bashrc
+
+# Install OpenClaw CLI + PyYAML for inline Python scripts in e2e tests.
+# OpenClaw version: change the OPENCLAW_VERSION ARG default so CI rebuilds
+# the base image on push to main, or use workflow_dispatch on base-image.yaml
+# with the openclaw_version input for a one-off build without editing this file.
+ARG OPENCLAW_VERSION=2026.4.24
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install OpenClaw CLI + PyYAML.
+# .openclaw is now writable by default, so exec-approvals writes to
+# ~/.openclaw/exec-approvals.json natively — no sed patch needed.
+RUN --mount=type=bind,source=nemoclaw-blueprint/blueprint.yaml,target=/tmp/blueprint.yaml \
+    echo "$OPENCLAW_VERSION" | grep -qxE '[0-9]+(\.[0-9]+)*' \
+    || { echo "Error: OPENCLAW_VERSION='$OPENCLAW_VERSION' is invalid (expected e.g. 2026.3.11)."; exit 1; }; \
+    OPENCLAW_MIN_VERSION=$(grep -m 1 'min_openclaw_version' /tmp/blueprint.yaml | awk '{print $2}' | tr -d '"'); \
+    [ -n "$OPENCLAW_MIN_VERSION" ] \
+    || { echo "Error: Could not parse min_openclaw_version from nemoclaw-blueprint/blueprint.yaml"; exit 1; }; \
+    if [ "$(printf '%s\n%s' "$OPENCLAW_MIN_VERSION" "$OPENCLAW_VERSION" | sort -V | head -n1)" != "$OPENCLAW_MIN_VERSION" ]; then \
+        echo "Error: OpenClaw version ${OPENCLAW_VERSION} is below the minimum required version ${OPENCLAW_MIN_VERSION}"; \
+        echo "Hint: Update min_openclaw_version in nemoclaw-blueprint/blueprint.yaml or use a newer version."; exit 1; \
+    fi; \
+    if ! npm view openclaw@${OPENCLAW_VERSION} version > /dev/null 2>&1; then \
+        echo "Error: OpenClaw version ${OPENCLAW_VERSION} not found on npm registry"; \
+        echo "Hint: Check available versions with: npm view openclaw versions"; exit 1; \
+    fi; \
+    npm install -g "openclaw@${OPENCLAW_VERSION}" \
+    && pip3 install --no-cache-dir --break-system-packages "pyyaml==6.0.3"
